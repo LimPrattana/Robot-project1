@@ -1,0 +1,248 @@
+/*****Vacum ******/
+int vacum = 12;
+bool vacum_status;
+
+/************* PARAMÈTRES MÉCANIQUES *************/
+#define RATIO      9.6
+#define CPR_MOTOR  11
+#define CPR_TOTAL  (CPR_MOTOR * RATIO)
+
+/************* FILTRE *************/
+#define ALPHA 0.85
+
+/************* PARAMÈTRES TEMPORELS *************/
+#define SAMPLE_MS      20
+#define NUM_MOTORS     3
+#define MAX_PWM        255
+
+/************* STRUCTURE MOTEUR *************/
+struct Motor {
+  uint8_t pinIN1, pinIN2, pinENA, pinENCA, pinENCB;
+  volatile long posi = 0;
+  long lastPosi = 0;
+  float rpm = 0;
+  float rpmFilt = 0;
+  bool forward = true;
+};
+
+Motor motors[NUM_MOTORS] = {
+  // IN1, IN2, ENA, ENCA, ENCB
+  {4,  2,  15, 18, 19}, // motor[0]
+  {16, 17, 5,  22, 23}, //motor[1]
+  {25, 26, 27, 32, 33} //motor
+};
+
+// มุมติดตั้งล้อ (เรเดียน): ล้อ1=0°, ล้อ2=120°, ล้อ3=240°
+//const float wheelAngle[NUM_MOTORS] = {0.0, 2.0944, 4.18879};
+// มุมติดตั้งล้อ (เรเดียน): ล้อ1=120°, ล้อ2=240°, ล้อ3=0°
+//const float wheelAngle[NUM_MOTORS] = {2.0944, 4.18879,0.0};
+
+// มุมติดตั้งล้อ (เรเดียน): ล้อ1=300°, ล้อ2=60°, ล้อ3=180°
+//const float wheelAngle[NUM_MOTORS] = {5.2360, 1.0472, 3.1416};
+
+// มุมติดตั้งล้อ (เรเดียน) — อ้างอิงจากภาพสเก็ต:
+// ล้อ1 = ซ้าย (150°), ล้อ2 = ขวา (30°), ล้อ3 = หลัง (270°)
+// มุมติดตั้งล้อ (เรเดียน) — อ้างอิงจากภาพสเก็ต:
+// ล้อ1 = ซ้าย (150°), ล้อ2 = ขวา (30°), ล้อ3 = หลัง (270°)
+const float wheelAngle[NUM_MOTORS] = {2.61799, 0.52360, 4.71239};
+//                                     ล้อ1(ซ้าย) ล้อ2(ขวา) ล้อ3(หลัง)
+//                                     = motors[0] motors[1] motors[2]                                    = motors[0] motors[1] motors[2]
+
+/************* สถานะความเร็วเป้าหมาย (สั่งจาก terminal) *************/
+float targetVx = 0.0;
+float targetVy = 0.0;
+float targetOmega = 0.0;
+float speedStep = 0.6;     // ขนาดก้าวเมื่อใช้คำสั่งตัวอักษร WASD
+
+/************* VARIABLES TEMPS *************/
+unsigned long t0 = 0;
+unsigned long lastSample = 0;
+float t = 0;
+float deltaT = 0;
+
+/************* บัฟเฟอร์รับคำสั่ง Serial *************/
+String inputBuffer = "";
+
+/**************** INTERRUPTION ****************/
+void IRAM_ATTR readEncoderISR(void* arg) {
+  Motor* m = (Motor*) arg;
+  int b = digitalRead(m->pinENCB);
+  if (b > 0) m->posi++; else m->posi--;
+}
+
+/************* FONCTION SENS DE ROTATION *************/
+void setDirection(Motor &m, bool fwd) {
+  digitalWrite(m.pinIN1, fwd ? HIGH : LOW);
+  digitalWrite(m.pinIN2, fwd ? LOW  : HIGH);
+}
+
+/************* คำนวณและสั่งความเร็วล้อจาก vx, vy, omega *************/
+void setRobotVelocity(float vx, float vy, float omega) {
+  float wheelSpeed[NUM_MOTORS];
+  float maxAbs = 0;
+
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    wheelSpeed[i] = -sin(wheelAngle[i]) * vx
+                    + cos(wheelAngle[i]) * vy
+                    + omega;
+    if (fabs(wheelSpeed[i]) > maxAbs) maxAbs = fabs(wheelSpeed[i]);
+  }
+
+  if (maxAbs > 1.0) {
+    for (int i = 0; i < NUM_MOTORS; i++) wheelSpeed[i] /= maxAbs;
+  }
+
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    bool fwd = (wheelSpeed[i] >= 0);
+    int pwm = constrain((int)(fabs(wheelSpeed[i]) * MAX_PWM), 0, MAX_PWM);
+
+    setDirection(motors[i], fwd);
+    motors[i].forward = fwd;
+    analogWrite(motors[i].pinENA, pwm);
+  }
+}
+
+/************* ประมวลผลคำสั่งจาก Terminal *************/
+void processCommand(String cmd) {
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  // --- โหมด 1: ตัวเลข "vx,vy,omega" ---
+  if (cmd.indexOf(',') >= 0) {
+    float vals[3] = {0, 0, 0};
+    int idx = 0;
+    int start = 0;
+    for (int i = 0; i <= cmd.length() && idx < 3; i++) {
+      if (i == cmd.length() || cmd.charAt(i) == ',') {
+        vals[idx++] = cmd.substring(start, i).toFloat();
+        start = i + 1;
+      }
+    }
+    targetVx = constrain(vals[0], -1.0, 1.0);
+    targetVy = constrain(vals[1], -1.0, 1.0);
+    targetOmega = constrain(vals[2], -1.0, 1.0);
+
+    Serial.print("[CMD] vx="); Serial.print(targetVx);
+    Serial.print(" vy="); Serial.print(targetVy);
+    Serial.print(" omega="); Serial.println(targetOmega);
+    return;
+  }
+
+  // --- โหมด 2: ตัวอักษรเดี่ยว (WASD-style) ---
+  char c = cmd.charAt(0);
+  switch (c) {
+    case 'm': vacum_status = true; Serial.print("Working...\n"); break;
+    case 'n': vacum_status = false; Serial.print("OFF\n"); break;
+    case 'w': targetVy = speedStep; targetVx = 0; targetOmega = 0; break; // เดินหน้า
+    case 's': targetVy = -speedStep; targetVx = 0; targetOmega = 0; break; // ถอยหลัง
+    case 'a': targetVx = -speedStep; targetVy = 0; targetOmega = 0; break; // ไปซ้าย (สไลด์)
+    case 'd': targetVx = speedStep; targetVy = 0; targetOmega = 0; break; // ไปขวา (สไลด์)
+    case 'q': targetOmega = -speedStep; targetVx = 0; targetVy = 0; break; // หมุนซ้าย
+    case 'e': targetOmega = speedStep; targetVx = 0; targetVy = 0; break; // หมุนขวา
+    case 'x': targetVx = 0; targetVy = 0; targetOmega = 0; break;          // หยุด
+    case '+': speedStep = constrain(speedStep + 0.1, 0.1, 1.0); Serial.print("[SPEED] "); Serial.println(speedStep); return;
+    case '-': speedStep = constrain(speedStep - 0.1, 0.1, 1.0); Serial.print("[SPEED] "); Serial.println(speedStep); return;
+    default:
+      Serial.println("[CMD ไม่รู้จัก] ใช้: w a s d q e x หรือ vx,vy,omega");
+      return;
+  }
+
+  Serial.print("[CMD] vx="); Serial.print(targetVx);
+  Serial.print(" vy="); Serial.print(targetVy);
+  Serial.print(" omega="); Serial.println(targetOmega);
+}
+
+/************* อ่าน Serial แบบไม่บล็อก *************/
+void readSerialCommand() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (inputBuffer.length() > 0) {
+        processCommand(inputBuffer);
+        inputBuffer = "";
+      }
+    } else {
+      inputBuffer += c;
+    }
+  }
+}
+
+/******************** SETUP ********************/
+void setup() {
+  Serial.begin(9600);
+  pinMode(vacum, OUTPUT);
+  vacum_status = false;
+
+  Serial.println("=== ควบคุมหุ่นยนต์ 3 ล้อโอมนิ ผ่าน Terminal ===");
+  Serial.println("คำสั่ง: w=หน้า s=หลัง a=ซ้าย d=ขวา q=หมุนซ้าย e=หมุนขวา x=หยุด m=เครื่องดูดทำงาน n=เครื่องดูดไม่ทำงาน");
+  Serial.println("หรือพิมพ์ vx,vy,omega เช่น 0.5,0,0.2  (ค่า -1.0 ถึง 1.0)");
+  Serial.println("+ / - ปรับความเร็วของคำสั่ง WASD");
+  Serial.println("t,rpm1,rpmFilt1,dir1,rpm2,rpmFilt2,dir2,rpm3,rpmFilt3,dir3");
+
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    pinMode(motors[i].pinIN1, OUTPUT);
+    pinMode(motors[i].pinIN2, OUTPUT);
+    pinMode(motors[i].pinENA, OUTPUT);
+    pinMode(motors[i].pinENCA, INPUT);
+    pinMode(motors[i].pinENCB, INPUT);
+
+    attachInterruptArg(digitalPinToInterrupt(motors[i].pinENCA),
+                        readEncoderISR, &motors[i], RISING);
+  }
+
+  setRobotVelocity(0, 0, 0);  // เริ่มต้นหยุดนิ่ง
+
+  t0 = micros();
+  lastSample = millis();
+}
+
+/******************** LOOP ********************/
+void loop() {
+  unsigned long now = millis();
+
+  /************* รับคำสั่งจาก terminal *************/
+  readSerialCommand();
+
+  /************* อัปเดตความเร็วมอเตอร์ทุกรอบ *************/
+  setRobotVelocity(targetVx, targetVy, targetOmega);
+
+  /************* ÉCHANTILLONNAGE VITESSE *************/
+  if (now - lastSample >= SAMPLE_MS) {
+    deltaT = (now - lastSample) / 1000.0;
+    lastSample = now;
+    t = (micros() - t0) / 1.0e6;
+
+   // Serial.print(t, 3);
+
+    for (int i = 0; i < NUM_MOTORS; i++) {
+      long pos;
+      noInterrupts();
+      pos = motors[i].posi;
+      interrupts();
+
+      long deltaP = pos - motors[i].lastPosi;
+      motors[i].lastPosi = pos;
+
+      motors[i].rpm = (deltaP / deltaT) * (60.0 / CPR_TOTAL);
+      motors[i].rpmFilt = ALPHA * motors[i].rpmFilt + (1.0 - ALPHA) * motors[i].rpm;
+
+
+     /* Serial.print(",");
+      Serial.print(motors[i].rpm, 1);
+      Serial.print(",");
+      Serial.print(motors[i].rpmFilt, 1);
+      Serial.print(",");
+      Serial.print(motors[i].forward ? "AVANT" : "ARRIERE");*/
+    }
+    //Serial.println();
+  }
+  if(vacum_status == true){
+        digitalWrite(vacum, HIGH);
+       
+      }
+      else{
+        digitalWrite(vacum, LOW);
+        
+      }
+
+}
