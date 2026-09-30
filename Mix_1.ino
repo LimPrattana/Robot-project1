@@ -13,7 +13,40 @@ char pass[] = "12345678";
 
 /******************** VACUUM LED ********************/
 int vacum = 12;
+int brush = 14;
 bool vacum_status = false;
+
+/******************** CAMERA CONTROLL ********************/
+#include <ESP32Servo.h>
+Servo servo1;
+Servo servo2;
+
+const int SERVO1_PIN = 13;
+const int SERVO2_PIN = 21;
+//set camera begining point//
+const int SERVO1_HOME = 90;   // ตำแหน่งเริ่มต้น Pan
+const int SERVO2_HOME = 0;   // ตำแหน่งเริ่มต้น Tilt
+int angle1 = SERVO1_HOME;     // มุมจริงตอนนี้
+int angle2 = SERVO2_HOME;
+int target1 = SERVO1_HOME;    // มุมเป้าหมาย (servo จะวิ่งเข้าหาค่านี้)
+int target2 = SERVO2_HOME;
+//camera controller//
+bool servo1Up = false;   // i
+bool servo1Down = false;  // k
+bool servo2Up = false;   // o
+bool servo2Down = false;  // l
+bool held1 = false;   // จำว่ารอบที่แล้วปุ่ม Servo1 ถูกกดค้างอยู่ไหม
+bool held2 = false;   // เหมือนกัน แต่ของ Servo2
+
+unsigned long lastMove = 0;
+int moveInterval = 100; // เวลาแต่ละการขยับ: มากขึ้น = ช้าลง
+const int stepSize = 1;      // องศาต่อครั้ง
+unsigned long lastServoReport = 0;  // เวลาที่ส่งมุมกลับไป Blynk ครั้งล่าสุด
+bool servoAngleChanged = true;      // มุมเปลี่ยนแล้วและยังไม่ได้ส่งกลับ
+bool sliderDriven = false;          // true = เป้าหมายมาจาก slider
+
+
+
 
 /************* PARAMÈTRES MÉCANIQUES *************/
 #define RATIO      9.6
@@ -73,6 +106,71 @@ String inputBuffer = "";
 
 /************* สถานะ Blynk *************/
 bool previousBlynkConnected = false;
+
+/****cam*****/
+void stopCamera() {
+  servo1Up = servo1Down = false;   // ปล่อยปุ่มทั้งหมด
+  servo2Up = servo2Down = false;
+}
+
+void centerCamera() {
+  stopCamera();
+  target1 = SERVO1_HOME;           // ตั้งเป้าหมายกลับบ้าน ไม่ได้สั่ง write ตรงๆ
+  target2 = SERVO2_HOME;           // servo จึงค่อยๆ เลื่อนกลับ ไม่กระชาก
+  sliderDriven = false;
+}
+
+bool stepToward(Servo &s, int &angle, int target) {
+  if (angle == target) return false;      // ถึงแล้ว ไม่ต้องทำอะไร
+
+  int diff = target - angle;              // เหลืออีกกี่องศา (บวก = ต้องเพิ่มมุม)
+  int step = min(stepSize, abs(diff));    // ก้าวไม่เกินระยะที่เหลือ กันวิ่งเลยเป้า
+  angle += (diff > 0) ? step : -step;     // เพิ่มหรือลดตามทิศ
+  s.write(angle);                         // สั่ง servo จริง
+  return true;                            // บอกว่ามีการขยับ
+}
+void updateServos() {
+  // ส่วนปุ่มกดค้าง
+  bool now1 = (servo1Up != servo1Down);   // กดแค่ปุ่มเดียวถึงนับ (กดพร้อมกันยกเลิกกัน)
+  bool now2 = (servo2Up != servo2Down);
+
+  if (now1)       { target1 = servo1Up ? 0 : 180; sliderDriven = false; }
+  else if (held1) { target1 = angle1; }   // เพิ่งปล่อยปุ่ม → หยุดที่มุมตอนนี้
+
+  if (now2)       { target2 = servo2Up ? 0 : 180; sliderDriven = false; }
+  else if (held2) { target2 = angle2; }
+
+  held1 = now1;                           // จำสถานะไว้เทียบรอบหน้า
+  held2 = now2;
+
+  // ส่วนจับเวลา (แทน delay ที่ทำให้โปรแกรมค้าง)
+  unsigned long now = millis();
+  if (now - lastMove < (unsigned long)moveInterval) return;
+  lastMove = now;
+
+  // ส่วนขยับ
+  bool moved = false;
+  moved |= stepToward(servo1, angle1, target1);
+  moved |= stepToward(servo2, angle2, target2);
+
+  if (moved) servoAngleChanged = true;
+}
+void reportServoAngles() {
+  if (!servoAngleChanged || !Blynk.connected()) return;   // ไม่มีอะไรเปลี่ยน หรือยังไม่ต่อ Blynk
+
+  if (sliderDriven) {                                     // ถ้ายังวิ่งตาม slider อยู่
+    if (angle1 != target1 || angle2 != target2) return;   // ห้ามส่ง รอให้ถึงเป้าก่อน
+    sliderDriven = false;
+  }
+
+  if (millis() - lastServoReport < 250) return;           // ส่งไม่เกิน 4 ครั้ง/วินาที
+
+  lastServoReport = millis();
+  servoAngleChanged = false;
+
+  Blynk.virtualWrite(V15, angle1);
+  Blynk.virtualWrite(V16, angle2);
+}
 
 /**************** ENCODER INTERRUPT ****************/
 void IRAM_ATTR readEncoderISR(void *arg) {
@@ -263,7 +361,35 @@ BLYNK_WRITE(V8){
     0
   );
 }
+// ปุ่มกดค้าง: กด = 1, ปล่อย = 0
+BLYNK_WRITE(V12)  { servo1Up   = param.asInt(); }
+BLYNK_WRITE(V13) { servo1Down = param.asInt(); }
+BLYNK_WRITE(V14) { servo2Up   = param.asInt(); }
+BLYNK_WRITE(V15) { servo2Down = param.asInt(); }
 
+// ปุ่มคืนตำแหน่ง
+BLYNK_WRITE(V16) {
+  if (param.asInt() == 1) {     // ทำเฉพาะตอนกด ไม่ทำตอนปล่อย
+    centerCamera();
+  }
+}
+
+// slider ความเร็ว 1–100
+BLYNK_WRITE(V17) {
+  int camSpeed = constrain(param.asInt(), 1, 100);
+  moveInterval = map(camSpeed, 1, 100, 200, 10);   // 1 → 200ms (ช้า), 100 → 10ms (เร็ว)
+}
+
+// slider มุม
+BLYNK_WRITE(V18) {
+  target1 = constrain(param.asInt(), 0, 180);      // กันค่านอกช่วง
+  sliderDriven = true;
+}
+
+BLYNK_WRITE(V19) {
+  target2 = constrain(param.asInt(), 0, 180);
+  sliderDriven = true;
+}
 
 /**************** เมื่อเชื่อมต่อ BLYNK ****************/
 BLYNK_CONNECTED() {
@@ -274,6 +400,7 @@ BLYNK_CONNECTED() {
   vacum_status = false;
 
   // รีเซ็ตปุ่มเคลื่อนที่ในแอป
+  // movement & vacum //
   Blynk.virtualWrite(V0, 0);
   Blynk.virtualWrite(V1, 0);
   Blynk.virtualWrite(V2, 0);
@@ -282,8 +409,20 @@ BLYNK_CONNECTED() {
   Blynk.virtualWrite(V5, 0);
   Blynk.virtualWrite(V6, 0);
 
+  
+
+  // cam //
+  stopCamera();                       // เคลียร์ปุ่มกล้องที่อาจค้างจากรอบก่อน
+  Blynk.virtualWrite(V12, 0);
+  Blynk.virtualWrite(V13, 0);
+  Blynk.virtualWrite(V14, 0);
+  Blynk.virtualWrite(V15, 0);
+  Blynk.virtualWrite(V16, 0);
+  servoAngleChanged = true;           // ส่งมุมจริงขึ้นไปให้ slider ตรงกับกล้อง
+
   // โหลดค่าความเร็วล่าสุดจาก Slider
   Blynk.syncVirtual(V7);
+  Blynk.syncVirtual(V17);             // โหลดความเร็วกล้องล่าสุด
 
   Serial.println("[BLYNK] Connected");
 }
@@ -427,6 +566,8 @@ void setup() {
 
   // LED จำลองเครื่องดูด
   pinMode(vacum, OUTPUT);
+  pinMode(brush, OUTPUT);
+
   digitalWrite(vacum, LOW);
   vacum_status = false;
 
@@ -450,8 +591,19 @@ void setup() {
   }
 
   // เริ่มต้นให้มอเตอร์หยุด
-  setRobotVelocity(0, 0, 0);
+  setRobotVelocity(0, 0, 0); 
+  //camera//
+  ESP32PWM::allocateTimer(2);   // จอง timer ให้ servo แยกจากมอเตอร์
+  ESP32PWM::allocateTimer(3);
+  servo1.setPeriodHertz(50);
+  servo2.setPeriodHertz(50);
 
+  servo1.attach(SERVO1_PIN, 500, 2500);
+  servo2.attach(SERVO2_PIN, 500, 2500);
+
+  servo1.write(angle1);
+  servo2.write(angle2);
+  //--------//
   t0 = micros();
   lastSample = millis();
 
@@ -465,6 +617,7 @@ void setup() {
   );
 
   Serial.println("ระบบพร้อมใช้งาน");
+ 
 }
 
 /******************** LOOP ********************/
@@ -477,6 +630,7 @@ void loop() {
   */
   if (previousBlynkConnected && !Blynk.connected()) {
     stopRobot();
+    stopCamera();
     vacum_status = false;
     previousBlynkConnected = false;
 
@@ -524,10 +678,18 @@ void loop() {
         (1.0 - ALPHA) * motors[i].rpm;
     }
   }
+ 
+  updateServos();
+  reportServoAngles();
 
-  /************* LED จำลองเครื่องดูด *************/
+  /************* Vacum & Brush *************/
   digitalWrite(
     vacum,
     vacum_status ? HIGH : LOW
   );
+  digitalWrite(
+    brush,
+    vacum_status ? HIGH : LOW
+  );
+  
 }
