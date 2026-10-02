@@ -309,7 +309,8 @@ BLYNK_WRITE(V4) {
     param.asInt(),
     0,
     0,
-    -speedStep
+    //-speedStep
+    -0.6
   );
 }
 
@@ -322,7 +323,8 @@ BLYNK_WRITE(V5) {
     param.asInt(),
     0,
     0,
-    speedStep
+    //speedStep
+    0.6
   );
 }
 
