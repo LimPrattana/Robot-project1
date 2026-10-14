@@ -24,7 +24,7 @@ Servo servo2;
 const int SERVO1_PIN = 13;
 const int SERVO2_PIN = 21;
 //set camera begining point//
-const int SERVO1_HOME = 90;   // ตำแหน่งเริ่มต้น Pan
+const int SERVO1_HOME = 100;   // ตำแหน่งเริ่มต้น Pan
 const int SERVO2_HOME = 0;   // ตำแหน่งเริ่มต้น Tilt
 int angle1 = SERVO1_HOME;     // มุมจริงตอนนี้
 int angle2 = SERVO2_HOME;
